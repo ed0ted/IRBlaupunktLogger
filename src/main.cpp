@@ -1,42 +1,39 @@
 #include <Arduino.h>
 #include <IRremote.hpp>
 #include <SPIFFS.h>
-#include <Preferences.h>  // For nonvolatile storage on ESP32
+#include <Preferences.h>
+#include <BleKeyboard.h>
 
-#define IR_RECEIVE_PIN 15  // Pin for the IR receiver
+// =========== IR Receiver Pin ===========
+#define IR_RECEIVE_PIN 15
 
-// --- Global Variables ---
-unsigned long timestampStart = 0;    // Start time for the current session (ms)
-  
-String lastButton = "";              // For detecting holds
-unsigned long lastButtonTimestamp = 0; 
-
-// This flag ensures a held button is logged only once per hold event.
+// =========== Global Variables (IR & File) ===========
+unsigned long timestampStart = 0;     // Session start time in ms
+String lastButton = "";
+unsigned long lastButtonTimestamp = 0;
 bool holdLogged = false;
+String currentFileName = "";
+bool sessionActive = false;
+bool awaitingSessionName = false;
 
-String currentFileName = "";         // File name of the active session (user provided)
-bool sessionActive = false;          // True when a session is recording
-bool awaitingSessionName = false;    // True when waiting for a new session name
-
-// Mode flag: true = IR Mode, false = File Management Mode.
-bool irMode = true;
-
-// For file management mode:
-String fileList[50];                 // Maximum of 50 files
+String fileList[50];                 // Up to 50 files
 int fileCount = 0;
-String fileName = "";                // Used in deletion routines
+String fileName = "";
+String logFileBase = "/premiere_log"; // Base for file naming
 
-// Although not used for session naming now, we still keep logFileBase for file management.
-String logFileBase = "/premiere_log";
+unsigned long lastClipTime = 0;      // Time of last logged clip
+int currentTrackIndex = 1;           // Track index for next clip
 
-// Globals for Premiere Pro track selection:
-unsigned long lastClipTime = 0;      // Time (ms relative to session start) of last logged clip
-int currentTrackIndex = 1;           // The track index for the next clip
-
-// Create a Preferences object for persistent storage.
 Preferences preferences;
 
-// --- Function Prototypes ---
+// =========== Global Variables (Mode & BLE) ===========
+// 1 = IR Mode, 2 = File Management, 3 = BLE Connect/Pair
+int currentMode = 0;  
+
+// Create a BLE Keyboard instance 
+BleKeyboard bleKeyboard("ESP32 Media Keyboard", "MyCompany", 100);
+
+// =========== Function Prototypes ===========
 void initFileSystem();
 void writeToFile(String line);
 void logCommand(String buttonName);
@@ -47,12 +44,15 @@ void sendAllFilesOverSerial();
 void handleButtonPress(uint32_t command);
 void handleSerialCommand(String command);
 void selectMode();
+void sendVolumeUp();
+void irModeLoop();
+void bleMode();  
 void setup();
 void loop();
 
-// --- Function Definitions ---
+// =========== File/IR Management Functions ===========
 
-// Initialize SPIFFS.
+// Initialize SPIFFS
 void initFileSystem() {
   if (!SPIFFS.begin(true)) {
     Serial.println("Failed to mount SPIFFS");
@@ -61,7 +61,7 @@ void initFileSystem() {
   Serial.println("SPIFFS mounted successfully");
 }
 
-// Append a line to the active session file.
+// Write a line to the active session file
 void writeToFile(String line) {
   if (currentFileName == "") {
     Serial.println("No active session file.");
@@ -76,29 +76,25 @@ void writeToFile(String line) {
   }
 }
 
-// Log a command (clip insertion) with timestamp and track selection.
-// (Power commands are reserved for ending the session.)
+// Log a command with timestamp + track selection
 void logCommand(String buttonName) {
-  unsigned long clipTime = millis() - timestampStart;  // Time (ms) relative to session start
-
-  // For non-session-control commands, update track selection.
-  if (buttonName != "power" && buttonName != "power_hold") {
-    if ((clipTime - lastClipTime) < 1000) {
-      currentTrackIndex++;
-    } else {
-      currentTrackIndex = 1;
-    }
-    lastClipTime = clipTime;
+  unsigned long clipTime = millis() - timestampStart;
+  // If clip is inserted <1s after last clip, increment track
+  if ((clipTime - lastClipTime) < 1000) {
+    currentTrackIndex++;
+  } else {
+    currentTrackIndex = 1;
   }
-  
+  lastClipTime = clipTime;
+
   String commandStr = "app.project.activeSequence.videoTracks[" + String(currentTrackIndex) +
-                        "].insertClip(\"" + buttonName + ".mp4\", " +
-                        String(clipTime / 1000.0, 3) + ");";
+                      "].insertClip(\"" + buttonName + ".mp4\", " +
+                      String(clipTime / 1000.0, 3) + ");";
   Serial.println(commandStr);
   writeToFile(commandStr);
 }
 
-// Send a file over Serial.
+// Send a file over Serial
 void sendFileOverSerial(const char *fileNameParam) {
   Serial.print("Sending: ");
   Serial.println(fileNameParam);
@@ -115,11 +111,11 @@ void sendFileOverSerial(const char *fileNameParam) {
   file.close();
 }
 
-// List all stored files with numbering.
+// List all stored files
 void listStoredFiles() {
   File root = SPIFFS.open("/");
   File file = root.openNextFile();
-  fileCount = 0;  // Reset counter
+  fileCount = 0;
   while (file && fileCount < 50) {
     fileList[fileCount] = file.path();
     Serial.printf("[%d] %s\n", fileCount + 1, file.path());
@@ -131,7 +127,7 @@ void listStoredFiles() {
   }
 }
 
-// Delete all files.
+// Delete all files
 void deleteAllFiles() {
   File root = SPIFFS.open("/");
   File file = root.openNextFile();
@@ -145,7 +141,7 @@ void deleteAllFiles() {
   fileName = "";
 }
 
-// Send all files over Serial.
+// Send all files over Serial
 void sendAllFilesOverSerial() {
   if (fileCount == 0) {
     Serial.println("No files to send.");
@@ -158,10 +154,9 @@ void sendAllFilesOverSerial() {
   Serial.println("END_ALL_FILE_TRANSFER");
 }
 
-// Process an IR remote command (except power).
+// Handle IR remote commands (except end-of-session)
 void handleButtonPress(uint32_t command) {
   String buttonName = "";
-  // Map IR command values (excluding the power command, which is used for ending a session)
   switch ((int)command) {
     case 25: buttonName = "ok"; break;
     case 24: buttonName = "right"; break;
@@ -176,12 +171,11 @@ void handleButtonPress(uint32_t command) {
   }
   if (buttonName == "") return;
   
-  // --- Improved Hold Detection ---
   bool isRepeat = false;
   #ifdef IRDATA_FLAGS_IS_REPEAT
     isRepeat = (IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT);
   #else
-    const unsigned long holdThreshold = 700; // ms
+    const unsigned long holdThreshold = 700;
     isRepeat = (buttonName == lastButton && (millis() - lastButtonTimestamp) < holdThreshold);
   #endif
   if (isRepeat) {
@@ -189,22 +183,19 @@ void handleButtonPress(uint32_t command) {
       buttonName += "_hold";
       holdLogged = true;
     } else {
-      return; // Already logged this hold event.
+      return;
     }
   } else {
     holdLogged = false;
   }
-  // --- End Hold Detection ---
-  
   logCommand(buttonName);
   lastButton = buttonName;
   lastButtonTimestamp = millis();
 }
 
-// Process serial commands in File Management mode.
+// Handle serial commands in File Management mode
 void handleSerialCommand(String command) {
   command.trim();
-  
   if (command == "menu") {
     selectMode();
     return;
@@ -263,150 +254,216 @@ void handleSerialCommand(String command) {
     Serial.println("  send <num>           - Send a specific file over Serial by number");
     Serial.println("  send all             - Send all files over Serial");
     Serial.println("  setbase <new_base>   - Change the log file base");
-    Serial.println("  menu                 - Exit File Management Mode and return to the main menu");
+    Serial.println("  menu                 - Return to the main menu");
   }
 }
 
-// Display the main menu and allow mode selection.
+// =========== Menu Selection ===========
+
 void selectMode() {
   Serial.println();
   Serial.println("========== MENU ==========");
   Serial.println("Select Mode:");
   Serial.println("1 - IR Mode (Record IR signals)");
   Serial.println("2 - File Management Mode");
+  Serial.println("3 - BLE Connect/Pair");
   Serial.println("Enter your choice:");
   
   while (!Serial.available()) {
     delay(100);
   }
   char choice = Serial.read();
-  while (Serial.available()) { Serial.read(); } // Clear leftover input
+  while (Serial.available()) { Serial.read(); }
   
   if (choice == '1') {
-    irMode = true;
+    currentMode = 1;
     Serial.println("IR Mode selected.");
   } else if (choice == '2') {
-    irMode = false;
+    currentMode = 2;
     Serial.println("File Management Mode selected.");
     Serial.println("Current log file base is: " + logFileBase);
     Serial.println("Available commands:");
     Serial.println("  list, delete, delete <num>, send <num>, send all, setbase <new_base>, menu");
-    Serial.println("Type 'menu' to return to the main menu.");
+    Serial.println("Type 'menu' to return to main menu.");
     listStoredFiles();
+  } else if (choice == '3') {
+    currentMode = 3;
+    Serial.println("BLE Connect/Pair selected.");
   } else {
     Serial.println("Invalid selection. Defaulting to IR Mode.");
-    irMode = true;
+    currentMode = 1;
   }
 }
 
-// --- Arduino Setup and Loop Functions ---
+// =========== BLE Keyboard Functions ===========
+
+// Send a Volume Up keypress
+void sendVolumeUp() {
+  if (bleKeyboard.isConnected()) {
+    Serial.println("Sending Volume Up...");
+    bleKeyboard.press(KEY_MEDIA_VOLUME_UP);
+    delay(100);
+    bleKeyboard.release(KEY_MEDIA_VOLUME_UP);
+    Serial.println("Volume Up sent.");
+  } else {
+    Serial.println("BLE keyboard not connected; cannot send Volume Up.");
+  }
+}
+
+// The BLE Connect/Pair mode (option 3)
+void bleMode() {
+  if (!bleKeyboard.isConnected()) {
+    bleKeyboard.begin();
+    Serial.println("BLE Keyboard started. Waiting for iOS to connect...");
+  }
+  Serial.println("Type 'menu' to return to main menu.");
+  
+  // Wait in a loop until user types 'menu'
+  while (true) {
+    if (bleKeyboard.isConnected()) {
+      preferences.putBool("paired", true);
+      Serial.println("BLE keyboard is connected to iOS!");
+    }
+    if (Serial.available()) {
+      String cmd = Serial.readStringUntil('\n');
+      cmd.trim();
+      if (cmd.equalsIgnoreCase("menu")) {
+        bleKeyboard.end();
+        currentMode = 0;
+        return;
+      }
+    }
+    delay(100);
+  }
+}
+
+// =========== IR Mode Loop ===========
+
+void irModeLoop() {
+  // If no session is active, prompt for a file name
+  if (!sessionActive) {
+    if (!awaitingSessionName) {
+      Serial.println("Enter file name for new session (or type 'menu' to return to menu):");
+      awaitingSessionName = true;
+    }
+    if (Serial.available()) {
+      String input = Serial.readStringUntil('\n');
+      input.trim();
+      if (input.equalsIgnoreCase("menu")) {
+        awaitingSessionName = false;
+        selectMode();
+        return;
+      }
+      if (input.charAt(0) != '/') {
+        input = "/" + input;
+      }
+      currentFileName = input + ".txt";
+      sessionActive = true;
+      awaitingSessionName = false;
+      timestampStart = millis();
+      lastClipTime = 0;
+      currentTrackIndex = 1;
+      Serial.println("Session started: " + currentFileName);
+      // Send Volume Up if BLE is connected
+      sendVolumeUp();
+      
+      // Flush IR signals
+      while (IrReceiver.decode()) { IrReceiver.resume(); }
+      delay(500);
+    }
+  } 
+  else {
+    // Session is active—process IR remote commands and also check for "end" in Serial
+    if (IrReceiver.decode()) {
+      uint32_t cmd = IrReceiver.decodedIRData.command;
+      // Log any IR command except end-of-session
+      handleButtonPress(cmd);
+      delay(500);
+      IrReceiver.resume();
+    }
+
+    // Check if user typed "end" in Serial to finish session
+    if (Serial.available()) {
+      String input = Serial.readStringUntil('\n');
+      input.trim();
+      if (input.equalsIgnoreCase("end")) {
+        // End the session
+        Serial.println("Session ended: " + currentFileName);
+        sendVolumeUp(); // Send Volume Up at session end
+
+        Serial.println("Do you want to save the recorded file? (y/n) or type 'menu' to return to main menu");
+        while (!Serial.available()) {
+          delay(100);
+        }
+        String decision = Serial.readStringUntil('\n');
+        decision.trim();
+        if (decision.equalsIgnoreCase("y")) {
+          Serial.println("File saved.");
+        } else if (decision.equalsIgnoreCase("menu")) {
+          if (SPIFFS.remove(currentFileName)) {
+            Serial.println("File deleted.");
+          } else {
+            Serial.println("Error deleting file.");
+          }
+          sessionActive = false;
+          currentFileName = "";
+          selectMode();
+          return;
+        } else {
+          // assume "n" or any other input means delete
+          if (SPIFFS.remove(currentFileName)) {
+            Serial.println("File deleted.");
+          } else {
+            Serial.println("Error deleting file.");
+          }
+        }
+        sessionActive = false;
+        currentFileName = "";
+        Serial.println("Type 'menu' to return to main menu, or press Enter to start a new session.");
+        unsigned long startTime = millis();
+        while ((millis() - startTime) < 3000) {
+          if (Serial.available()) {
+            String menuDecision = Serial.readStringUntil('\n');
+            menuDecision.trim();
+            if (menuDecision.equalsIgnoreCase("menu")) {
+              selectMode();
+              return;
+            }
+          }
+          delay(100);
+        }
+      }
+    }
+  }
+}
+
+// =========== Setup & Loop ===========
+
 void setup() {
   Serial.begin(115200);
-  IrReceiver.begin(IR_RECEIVE_PIN, ENABLE_LED_FEEDBACK); // Initialize IR receiver
-  initFileSystem();  // Mount SPIFFS
+  IrReceiver.begin(IR_RECEIVE_PIN, ENABLE_LED_FEEDBACK);
+  initFileSystem();
   
-  // Open preferences and load stored log file base.
   preferences.begin("my-app", false);
   logFileBase = preferences.getString("logBase", "/premiere_log");
   Serial.println("Log file base loaded: " + logFileBase);
   
-  selectMode();  // Show main menu.
+  selectMode();
 }
 
 void loop() {
-  // ----- IR Mode: Recording IR signals -----
-  if (irMode) {
-    // If no session is active, prompt for a file name.
-    if (!sessionActive) {
-      if (!awaitingSessionName) {
-        Serial.println("Enter file name for new session (or type 'menu' to return to menu):");
-        awaitingSessionName = true;
-      }
-      if (Serial.available()) {
-        String input = Serial.readStringUntil('\n');
-        input.trim();
-        if (input.equalsIgnoreCase("menu")) {
-          awaitingSessionName = false;
-          selectMode();
-          return;
-        }
-        // Prepend '/' if missing.
-        if (input.charAt(0) != '/') {
-          input = "/" + input;
-        }
-        currentFileName = input + ".txt";
-        sessionActive = true;
-        awaitingSessionName = false;
-        timestampStart = millis();
-        lastClipTime = 0;
-        currentTrackIndex = 1;
-        Serial.println("Session started: " + currentFileName);
-        // Flush any pending IR signals and wait a bit.
-        while (IrReceiver.decode()) { IrReceiver.resume(); }
-        delay(500);
-      }
-    } else {
-      // Session is active—process IR remote commands.
-      if (IrReceiver.decode()) {
-        uint32_t cmd = IrReceiver.decodedIRData.command;
-        // If the power button (assumed value 33) is pressed, end the session.
-        if ((int)cmd == 33) {
-          Serial.println("Session ended: " + currentFileName);
-          Serial.println("Do you want to save the recorded file? (y/n) or type 'menu' to return to main menu");
-          while (!Serial.available()) {
-            delay(100);
-          }
-          String decision = Serial.readStringUntil('\n');
-          decision.trim();
-          if (decision.equalsIgnoreCase("y")) {
-            Serial.println("File saved.");
-          } else if (decision.equalsIgnoreCase("menu")) {
-            if (SPIFFS.remove(currentFileName)) {
-              Serial.println("File deleted.");
-            } else {
-              Serial.println("Error deleting file.");
-            }
-            sessionActive = false;
-            currentFileName = "";
-            selectMode();
-            return;
-          } else {  // assume "n" or any other input means delete
-            if (SPIFFS.remove(currentFileName)) {
-              Serial.println("File deleted.");
-            } else {
-              Serial.println("Error deleting file.");
-            }
-          }
-          sessionActive = false;
-          currentFileName = "";
-          Serial.println("Type 'menu' to return to main menu, or press Enter to start a new session.");
-          unsigned long startTime = millis();
-          while ((millis() - startTime) < 3000) {  // Wait up to 3 seconds for input.
-            if (Serial.available()) {
-              String menuDecision = Serial.readStringUntil('\n');
-              menuDecision.trim();
-              if (menuDecision.equalsIgnoreCase("menu")) {
-                selectMode();
-                return;
-              }
-            }
-            delay(100);
-          }
-          return;
-        } else {
-          // Process any other IR command.
-          handleButtonPress(cmd);
-        }
-        delay(500);  // Delay to minimize duplicate logging.
-        IrReceiver.resume();
-      }
-    }
-  }
-  // ----- File Management Mode -----
-  else {
+  if (currentMode == 0) {
+    selectMode();
+  } else if (currentMode == 1) {
+    irModeLoop();
+  } else if (currentMode == 2) {
+    // File Management
     if (Serial.available()) {
       String input = Serial.readStringUntil('\n');
       handleSerialCommand(input);
     }
+  } else if (currentMode == 3) {
+    bleMode();
   }
+  delay(10);
 }
