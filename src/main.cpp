@@ -27,7 +27,7 @@ int currentTrackIndex = 1;           // Track index for next clip
 Preferences preferences;
 
 // =========== Global Variables (Mode & BLE) ===========
-// 1 = IR Mode, 2 = File Management, 3 = BLE Connect/Pair
+ // 1 = IR Mode, 2 = File Management, 3 = BLE Connect/Pair
 int currentMode = 0;  
 
 // Create a BLE Keyboard instance 
@@ -79,16 +79,16 @@ void writeToFile(String line) {
 // Log a command with timestamp + track selection
 void logCommand(String buttonName) {
   unsigned long clipTime = millis() - timestampStart;
-  // If clip is inserted <1s after last clip, increment track
+  // If clip is inserted less than 1 second after last clip, increment track;
+  // otherwise, use track 1.
   if ((clipTime - lastClipTime) < 1000) {
     currentTrackIndex++;
   } else {
     currentTrackIndex = 1;
   }
   lastClipTime = clipTime;
-
-  String commandStr = "app.project.activeSequence.videoTracks[" + String(currentTrackIndex) +
-                      "].insertClip(\"" + buttonName + ".mp4\", " +
+  String commandStr = "app.project.activeSequence.videoTracks[" + String(currentTrackIndex+1) +
+                      "].insertClip(findClipByName(\"" + buttonName + ".mov\"), " +
                       String(clipTime / 1000.0, 3) + ");";
   Serial.println(commandStr);
   writeToFile(commandStr);
@@ -154,7 +154,7 @@ void sendAllFilesOverSerial() {
   Serial.println("END_ALL_FILE_TRANSFER");
 }
 
-// Handle IR remote commands (except end-of-session)
+// Handle IR remote commands (except ending the session)
 void handleButtonPress(uint32_t command) {
   String buttonName = "";
   switch ((int)command) {
@@ -259,7 +259,6 @@ void handleSerialCommand(String command) {
 }
 
 // =========== Menu Selection ===========
-
 void selectMode() {
   Serial.println();
   Serial.println("========== MENU ==========");
@@ -297,7 +296,7 @@ void selectMode() {
 
 // =========== BLE Keyboard Functions ===========
 
-// Send a Volume Up keypress
+// Send a Volume Up keypress via BLE Keyboard
 void sendVolumeUp() {
   if (bleKeyboard.isConnected()) {
     Serial.println("Sending Volume Up...");
@@ -310,7 +309,7 @@ void sendVolumeUp() {
   }
 }
 
-// The BLE Connect/Pair mode (option 3)
+// BLE Connect/Pair Mode (Option 3)
 void bleMode() {
   if (!bleKeyboard.isConnected()) {
     bleKeyboard.begin();
@@ -318,7 +317,6 @@ void bleMode() {
   }
   Serial.println("Type 'menu' to return to main menu.");
   
-  // Wait in a loop until user types 'menu'
   while (true) {
     if (bleKeyboard.isConnected()) {
       preferences.putBool("paired", true);
@@ -338,9 +336,8 @@ void bleMode() {
 }
 
 // =========== IR Mode Loop ===========
-
+// In this version, the session is ended when the user types "end" in the Serial Monitor.
 void irModeLoop() {
-  // If no session is active, prompt for a file name
   if (!sessionActive) {
     if (!awaitingSessionName) {
       Serial.println("Enter file name for new session (or type 'menu' to return to menu):");
@@ -364,59 +361,29 @@ void irModeLoop() {
       lastClipTime = 0;
       currentTrackIndex = 1;
       Serial.println("Session started: " + currentFileName);
-      // Send Volume Up if BLE is connected
+      // Send Volume Up at session start if BLE is connected
       sendVolumeUp();
-      
-      // Flush IR signals
       while (IrReceiver.decode()) { IrReceiver.resume(); }
       delay(500);
     }
-  } 
-  else {
-    // Session is active—process IR remote commands and also check for "end" in Serial
+  } else {
+    // Session is active—record IR commands
     if (IrReceiver.decode()) {
       uint32_t cmd = IrReceiver.decodedIRData.command;
-      // Log any IR command except end-of-session
       handleButtonPress(cmd);
       delay(500);
       IrReceiver.resume();
     }
-
-    // Check if user typed "end" in Serial to finish session
+    // Check if user typed "end" to finish session
     if (Serial.available()) {
       String input = Serial.readStringUntil('\n');
       input.trim();
       if (input.equalsIgnoreCase("end")) {
-        // End the session
         Serial.println("Session ended: " + currentFileName);
-        sendVolumeUp(); // Send Volume Up at session end
-
-        Serial.println("Do you want to save the recorded file? (y/n) or type 'menu' to return to main menu");
-        while (!Serial.available()) {
-          delay(100);
-        }
-        String decision = Serial.readStringUntil('\n');
-        decision.trim();
-        if (decision.equalsIgnoreCase("y")) {
-          Serial.println("File saved.");
-        } else if (decision.equalsIgnoreCase("menu")) {
-          if (SPIFFS.remove(currentFileName)) {
-            Serial.println("File deleted.");
-          } else {
-            Serial.println("Error deleting file.");
-          }
-          sessionActive = false;
-          currentFileName = "";
-          selectMode();
-          return;
-        } else {
-          // assume "n" or any other input means delete
-          if (SPIFFS.remove(currentFileName)) {
-            Serial.println("File deleted.");
-          } else {
-            Serial.println("Error deleting file.");
-          }
-        }
+        // Send Volume Up at session end if BLE is connected
+        sendVolumeUp();
+        // Automatically save the file (always saved)
+        Serial.println("File saved.");
         sessionActive = false;
         currentFileName = "";
         Serial.println("Type 'menu' to return to main menu, or press Enter to start a new session.");
@@ -438,7 +405,6 @@ void irModeLoop() {
 }
 
 // =========== Setup & Loop ===========
-
 void setup() {
   Serial.begin(115200);
   IrReceiver.begin(IR_RECEIVE_PIN, ENABLE_LED_FEEDBACK);
@@ -457,7 +423,6 @@ void loop() {
   } else if (currentMode == 1) {
     irModeLoop();
   } else if (currentMode == 2) {
-    // File Management
     if (Serial.available()) {
       String input = Serial.readStringUntil('\n');
       handleSerialCommand(input);
